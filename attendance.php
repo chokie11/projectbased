@@ -1,0 +1,1258 @@
+<?php
+// attendance.php
+date_default_timezone_set('Asia/Manila');
+
+include 'db.php';
+session_start();
+
+if (!isset($_SESSION["user_id"])) {
+    header("Location: login.php");
+    exit;
+}
+
+$user_id = $_SESSION['user_id'];
+
+/* CHECK TODAY STATUS */
+$check = $conn->prepare("
+    SELECT * FROM attendance 
+    WHERE user_id=? AND DATE(created_at)=CURDATE()
+    LIMIT 1
+");
+
+$check->bind_param("i", $user_id);
+$check->execute();
+$res = $check->get_result();
+$today = $res->fetch_assoc();
+
+$hasTimeIn = $today && !empty($today['time_in']);
+$hasTimeOut = $today && !empty($today['time_out']);
+$hasBreakIn = $today && !empty($today['break_in']);
+$hasBreakOut = $today && !empty($today['break_out']);
+
+/* FETCH RECORDS */
+/* FETCH RECORDS */
+$from = $_GET['from'] ?? null;
+$to = $_GET['to'] ?? null;
+$query = "
+SELECT 
+    a.*, 
+    r.status AS report_status, 
+    r.reject_reason, 
+    CONCAT(u.firstname, ' ', u.middlename, ' ', u.lastname) AS fullname,
+
+    b1.last_break_in,
+    b2.last_break_out
+
+FROM attendance a
+
+LEFT JOIN attendance_reports r 
+    ON a.id = r.attendance_id
+
+LEFT JOIN users u
+    ON u.id = a.user_id
+
+/* ✅ GET LAST BREAK IN */
+LEFT JOIN (
+    SELECT attendance_id, MAX(break_in) AS last_break_in
+    FROM breaks
+    GROUP BY attendance_id
+) b1 ON b1.attendance_id = a.id
+
+/* ✅ GET LAST BREAK OUT */
+LEFT JOIN (
+    SELECT attendance_id, MAX(break_out) AS last_break_out
+    FROM breaks
+    GROUP BY attendance_id
+) b2 ON b2.attendance_id = a.id
+
+WHERE a.user_id = ?
+";
+$params = [$user_id];
+$types = "i";
+
+/* ONE DATE (FROM only) */
+if ($from && !$to) {
+    $query .= " AND DATE(a.created_at) = ?";
+    $params[] = $from;
+    $types .= "s";
+}
+
+/* ONE DATE (TO only) */ elseif (!$from && $to) {
+    $query .= " AND DATE(a.created_at) = ?";
+    $params[] = $to;
+    $types .= "s";
+}
+
+/* DATE RANGE */ elseif ($from && $to) {
+    $query .= " AND DATE(a.created_at) BETWEEN ? AND ?";
+    $params[] = $from;
+    $params[] = $to;
+    $types .= "ss";
+}
+
+$query .= " ORDER BY a.created_at DESC";
+
+$stmt = $conn->prepare($query);
+$stmt->bind_param($types, ...$params);
+$stmt->execute();
+$result = $stmt->get_result();
+?>
+
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Attendance System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="attendance.css">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons/font/bootstrap-icons.css" rel="stylesheet">
+
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <style>
+        body {
+            background: #F1F1F1;
+            font-family: 'Segoe UI';
+            min-height: 100vh;
+        }
+
+        .card-glass {
+            background: white;
+            backdrop-filter: blur(15px);
+            border-radius: 20px;
+            padding: 30px;
+            color: black;
+            -webkit-box-shadow: 2px 4px 12px -1px rgba(60, 60, 60, 0.75);
+            box-shadow: 2px 4px 12px -1px rgba(60, 60, 60, 0.75);
+        }
+
+        video {
+            width: 100%;
+            border-radius: 15px;
+        }
+
+        input[type="date"] {
+            border-radius: 12px;
+            padding: 10px;
+        }
+
+        .btn {
+            border-radius: 12px;
+            font-weight: 600;
+        }
+
+        .card-glass {
+            transition: 0.3s ease;
+        }
+
+        .attendance-actions .btn {
+            min-width: 140px;
+        }
+
+        @media (max-width:768px) {
+
+            .attendance-actions {
+                width: 100%;
+            }
+
+            .attendance-actions .btn {
+                flex: 1 1 48%;
+            }
+
+        }
+
+        /* HEADER RESPONSIVE FIX */
+        .header-wrapper {
+            margin-bottom: 10px;
+        }
+
+        .header-actions .btn {
+            white-space: nowrap;
+        }
+
+        /* MOBILE VIEW */
+        @media (max-width: 576px) {
+
+            .header-wrapper {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .header_attendance h4 {
+                font-size: 18px;
+            }
+
+            .header_attendance {
+                text-align: center
+            }
+
+            .header-actions {
+                width: 100%;
+                justify-content: space-between;
+            }
+
+            .header-actions .btn {
+                flex: 1;
+                font-size: 14px;
+                padding: 8px;
+            }
+        }
+
+        #manualAddressText {
+    background: #e7f1ff;
+    padding: 8px 12px;
+    border-radius: 8px;
+}
+    </style>
+</head>
+
+<body>
+
+
+    <!-- //do it in crod or dashboard-->
+    <script>
+        setInterval(() => {
+
+            fetch("heartbeat.php", {
+                method: "POST"
+            });
+
+        }, 30000); // every 30 seconds
+    </script>
+
+    <?php
+
+    // $conn->query("
+// UPDATE user_portal_sessions
+// SET 
+//     logout_time = last_activity,
+//     session_duration = TIMESTAMPDIFF(SECOND, login_time, last_activity)
+// WHERE 
+//     logout_time IS NULL
+//     AND last_activity < (NOW() - INTERVAL 5 MINUTE)
+// ");
+    
+    ?>
+
+
+
+    <div class="container py-5">
+
+        <!-- <button onclick="window.location.href='logout.php'">Logout</button> -->
+
+
+        <div class="mb-4">
+
+            <!-- HEADER ROW -->
+            <div class="header-wrapper d-flex justify-content-between align-items-center flex-wrap gap-3">
+
+                <!-- LEFT SIDE -->
+                <div class="header_attendance">
+                    <h4 class="mb-0">My Attendance</h4>
+                    <p id="currentDateTime" class="mb-0 text-muted small"></p>
+                </div>
+
+                <!-- RIGHT SIDE BUTTONS -->
+                <div class="header-actions d-flex gap-2 flex-wrap">
+
+                    <a href="leave.php" class="btn btn-success rounded-pill">
+                        <i class="bi bi-calendar-plus me-1"></i>
+                        <span class="d-sm-inline">File Leave</span>
+                    </a>
+
+                    <a href="logout.php" class="btn btn-outline-dark rounded-pill">
+                        <i class="bi bi-box-arrow-right me-1"></i>
+                        <span class=" d-sm-inline">Logout</span>
+                    </a>
+
+                </div>
+
+            </div>
+
+            <!-- ATTENDANCE ACTION BUTTONS -->
+            <div class="attendance-actions mt-3 d-flex flex-wrap gap-2">
+<?php
+$hasTimeIn = $today && !empty($today['time_in']);
+$hasTimeOut = $today && !empty($today['time_out']);
+
+// NEW: based on last break
+$hasActiveBreak = false;
+
+if ($today) {
+
+    $breakCheck = $conn->prepare("
+        SELECT * FROM breaks 
+        WHERE attendance_id=? AND break_out IS NULL
+        LIMIT 1
+    ");
+    $breakCheck->bind_param("i", $today['id']);
+    $breakCheck->execute();
+    $activeBreak = $breakCheck->get_result();
+
+    $hasActiveBreak = $activeBreak->num_rows > 0;
+}?>
+
+<!-- TIME IN -->
+<button class="btn btn-success"
+    <?= $hasTimeIn ? 'disabled' : '' ?>
+    onclick="requestAccess('in')">
+    Time In
+</button>
+
+<!-- BREAK IN -->
+<button class="btn btn-warning"
+    <?= (!$hasTimeIn || $hasActiveBreak || $hasTimeOut) ? 'disabled' : '' ?>
+    onclick="breakAction('break_in')">
+    Break In
+</button>
+
+<!-- BREAK OUT -->
+<button class="btn btn-warning"
+    <?= (!$hasActiveBreak || $hasTimeOut) ? 'disabled' : '' ?>
+    onclick="breakAction('break_out')">
+    Break Out
+</button>
+
+<!-- TIME OUT -->
+<button class="btn btn-danger"
+    <?= (!$hasTimeIn || $hasTimeOut) ? 'disabled' : '' ?>
+    onclick="requestAccess('out')">
+    Time Out
+</button>
+
+            </div>
+
+        </div>
+
+        <script>
+            function updateDateTime() {
+                const now = new Date();
+
+                const options = {
+                    weekday: 'long',   // 👈 This shows Monday, Tuesday, etc.
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                };
+
+                document.getElementById("currentDateTime").innerText =
+                    now.toLocaleString('en-PH', options);
+            }
+
+            // Run immediately
+            updateDateTime();
+
+            // Update every second
+            setInterval(updateDateTime, 1000);
+        </script>
+
+
+        <form method="GET" class="mb-4">
+            <div class="card-glass p-3">
+                <div class="row g-2 align-items-end">
+                    <div class="col-12 col-md-4">
+                        <label class="form-label fw-semibold">From</label>
+                        <input type="date" name="from" class="form-control" value="<?= $_GET['from'] ?? '' ?>">
+                    </div>
+
+                    <div class="col-12 col-md-4">
+                        <label class="form-label fw-semibold">To</label>
+                        <input type="date" name="to" class="form-control" value="<?= $_GET['to'] ?? '' ?>">
+                    </div>
+
+                    <div class="col-12 col-md-4 d-flex gap-2">
+                        <button class="btn btn-success rounded-pill w-100">
+                            🔍 Filter
+                        </button>
+
+                        <a href="attendance.php" class="btn btn-outline-secondary rounded-pill w-100">
+                            Reset
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </form>
+
+
+        <div class="card-glass">
+
+
+            <div class="table-responsive">
+
+                <?php if ($from || $to): ?>
+                    <div class="mb-3 text-muted">
+                        <?php if ($from && $to): ?>
+                            Showing records from <strong><?= date('M d, Y', strtotime($from)) ?></strong>
+                            to <strong><?= date('M d, Y', strtotime($to)) ?></strong>
+                        <?php else: ?>
+                            Showing records for <strong>
+                                <?= date('M d, Y', strtotime($from ?? $to)) ?>
+                            </strong>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
+                <table class="table text-white text-center">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th class="d-none d-md-table-cell">Name</th>
+                            <th>Time In</th>
+                            <th>Break In</th>
+                            <th>Break Out</th>
+                            <th>Time Out</th>
+                            <th class="d-none d-md-table-cell">Duration</th>
+                            <th>Report</th>
+                        </tr>
+
+                    </thead>
+                    <tbody>
+
+                        <?php if ($result->num_rows === 0): ?>
+                            <tr>
+                                <td colspan="8" class="text-center py-4 text-muted">
+                                    No attendance records found 📭
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+
+                        <?php while ($row = $result->fetch_assoc()):
+
+                            $duration = "-";
+
+                           if ($row['time_in'] && $row['time_out']) {
+
+    $start = new DateTime($row['time_in']);
+    $end = new DateTime($row['time_out']);
+    $totalSeconds = $end->getTimestamp() - $start->getTimestamp();
+
+    // ✅ NEW: get TOTAL break time from breaks table
+    $breakQuery = $conn->prepare("
+        SELECT SUM(TIMESTAMPDIFF(SECOND, break_in, break_out)) as totalBreak
+        FROM breaks
+        WHERE attendance_id=?
+    ");
+    $breakQuery->bind_param("i", $row['id']);
+    $breakQuery->execute();
+    $breakRes = $breakQuery->get_result()->fetch_assoc();
+
+    $breakSeconds = $breakRes['totalBreak'] ?? 0;
+
+    $workSeconds = $totalSeconds - $breakSeconds;
+
+    $hours = floor($workSeconds / 3600);
+    $minutes = floor(($workSeconds % 3600) / 60);
+
+    $duration = $hours . " hrs " . $minutes . " mins";
+}
+                            ?>
+                            <tr>
+                                <td>
+                                    <span
+                                        class="d-none d-md-inline"><?= date('F d, Y', strtotime($row['created_at'])) ?></span>
+                                    <span
+                                        class="d-inline d-md-none"><?= date('M d, Y', strtotime($row['created_at'])) ?></span>
+                                </td>
+                                <td class="d-none d-md-table-cell">
+                                    <?= $row['fullname'] ?>
+                                </td>
+                                <td><?= $row['time_in'] ? date('h:i A', strtotime($row['time_in'])) : '-' ?></td>
+
+                             <td><?= $row['last_break_in'] ? date('h:i A', strtotime($row['last_break_in'])) : '-' ?></td>
+<td><?= $row['last_break_out'] ? date('h:i A', strtotime($row['last_break_out'])) : '-' ?></td>
+
+                                <td><?= $row['time_out'] ? date('h:i A', strtotime($row['time_out'])) : '-' ?></td>
+
+                                <td class="d-none d-md-table-cell"><?= $duration ?></td>
+                                <!-- <td>
+                                    <button class="btn btn-sm btn-outline-danger report-btn"
+                                        onclick="openReportModal(<?= $row['id'] ?>)">
+
+                                        <span class="d-none d-md-inline"><i class="bi bi-flag-fill me-1"></i> Report</span>
+                                        <span class="d-inline d-md-none"><i class="bi bi-flag-fill me-1"></i> </span>
+
+
+                                    </button>
+                                </td> -->
+
+                                <td>
+                                    <?php if ($row['report_status'] === 'pending'): ?>
+                                        <button class="btn btn-sm btn-warning rounded-pill" disabled>
+                                            <!-- <i class="bi bi-hourglass-split me-1"></i> Pending -->
+
+                                            <span class="d-none d-md-inline"> <i class="bi bi-hourglass-split me-1"></i>
+                                                Pending</span>
+                                            <span class="d-inline d-md-none"> Pending</span>
+
+                                        </button>
+
+                                    <?php elseif ($row['report_status'] === 'rejected'): ?>
+                                        <button class="btn btn-sm btn-danger rounded-pill" onclick="openRejectedModal(
+    `<?= htmlspecialchars($row['reject_reason']) ?>`,
+    <?= $row['id'] ?>
+)">
+
+                                            <span class="d-none d-md-inline"> <i class="bi bi-x-circle me-1"></i> Rejected
+                                            </span>
+                                            <span class="d-inline d-md-none"> <i class="bi bi-x-circle me-1"></i> </span>
+
+                                            <!-- <i class="bi bi-x-circle me-1"></i> Rejected -->
+                                        </button>
+
+                                    <?php elseif ($row['report_status'] === 'approved'): ?>
+                                        <button class="btn btn-sm btn-success rounded-pill" disabled>
+
+                                            <span class="d-none d-md-inline"> <i class="bi bi-check-circle me-1"></i>
+                                                Approved</span>
+
+                                            <span class="d-inline d-md-none"> <i class="bi bi-check-circle me-1"></i> </span>
+
+                                            <!-- <i class="bi bi-check-circle me-1"></i> Approved -->
+                                        </button>
+
+                                    <?php else: ?>
+                                        <button class="btn btn-sm btn-outline-danger rounded-pill"
+                                            onclick="openReportModal(<?= $row['id'] ?>)">
+
+                                            <span class="d-none d-md-inline"> <i class="bi bi-flag-fill me-1"></i> Report
+                                            </span>
+                                            <span class="d-inline d-md-none"> <i class="bi bi-flag-fill me-1"></i></span>
+
+
+
+                                        </button>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endwhile; ?>
+                    </tbody>
+                </table>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- MODAL -->
+    <div class="modal fade" id="attendanceModal">
+        <div class="modal-dialog  modal-lg">
+
+            <div class="modal-content p-4">
+                <div class="container-fluid ">
+                    <div class="row">
+                        <div class="col">
+                            <h2 id="modalTitle"></h2>
+                            <p style="margin-top: -10px;"> <?php echo date('l, F d, Y'); ?></p>
+
+
+
+                        </div>
+                        <button class="btn-close" data-bs-dismiss="modal"></button>
+
+                        <div class="row g-3 align-items-stretch" id="displaying">
+                            <div class="col-12 col-md-6 d-flex">
+                                <div class="media-box w-100">
+                                    <video id="video" autoplay></video>
+                                    <canvas id="canvas" style="display:none;"></canvas>
+                                </div>
+                            </div>
+                            <div class="col-12 col-md-6 d-flex">
+                                <div id="mapContainer" class="media-box w-100">
+                                    <iframe id="mapFrame" loading="lazy" allowfullscreen></iframe>
+                                </div>
+                            </div>
+                        </div>
+
+
+
+                        <div class="row">
+                            <div style="text-align: center; margin-top: 20px;">
+                                <h1 style="font-size:45px"> <?php echo date('g:i A'); ?></h1>
+                              <p id="addressText"></p>
+
+<!-- NEW: manual location display -->
+<p id="manualAddressText" class="text-primary fw-semibold" style="display:none;"></p>
+
+
+                            </div>
+
+                            <div id="addressLoader" style="display:none; text-align: center; ">
+                                <div class="spinner-border text-success" role="status"
+                                    style="width: 1.5rem; height: 1.5rem;">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div> <span class="ms-2">Fetching address...</span>
+                            </div>
+
+              <button id="manualLocationBtn" 
+        class="btn btn-link text-danger p-0" 
+        style="display:none;"
+        onclick="openMapPicker()">
+    📍 Your location is not accurate?
+</button>
+                            <button id="confirmBtn" class="btn btn-success w-100 mt-3" onclick="submitAttendance()">
+
+                                <span id="btnText">Confirm</span>
+
+                                <span id="btnLoader" class="spinner-border spinner-border-sm ms-2" style="display:none;"
+                                    role="status">
+                                </span>
+
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="modal fade" id="mapPickerModal">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content p-3">
+
+                <div class="modal-header">
+                    <h5>Select Correct Location</h5>
+                    <button class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+
+                <div class="modal-body">
+                    <div id="mapPicker" style="height:400px; border-radius:10px;"></div>
+                    <p class="mt-2 text-muted small">
+                        Tap on the map to set your location.
+                    </p>
+                </div>
+
+                <div class="modal-footer">
+                    <button class="btn btn-success" onclick="confirmPickedLocation()">
+                        Confirm Location
+                    </button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+
+    <div class="modal fade" id="reportModal">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content report-glass">
+
+                <div class="modal-header border-0">
+                    <div>
+                        <h5 class="modal-title fw-bold">Attendance Report</h5>
+                        <small class="text-muted">
+                            Submit a justification for missing time in/out
+                        </small>
+                    </div>
+                    <button class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+
+                <div class="modal-body">
+
+                    <input type="hidden" id="reportAttendanceId">
+
+                    <!-- Report Type -->
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Report Type</label>
+                        <select id="reportType" class="form-select modern-input">
+                            <option value="time_in">Missed Time In</option>
+                            <option value="time_out">Missed Time Out</option>
+                            <option value="both">Missed Both</option>
+                        </select>
+                    </div>
+
+                    <!-- Reason -->
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Explanation</label>
+                        <textarea id="reportReason" class="form-control modern-input" rows="4"
+                            placeholder="Explain what happened (e.g. no signal, device issue, forgot to time in)..."></textarea>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Proof (Required)</label>
+
+                        <div class="proof-box" onclick="document.getElementById('reportProof').click()">
+                            <input type="file" id="reportProof" accept="image/*" multiple hidden>
+
+                            <div id="proofPlaceholder">
+                                <i class="bi bi-cloud-upload fs-1 text-success"></i>
+                                <p class="mb-1 fw-semibold mt-2">Upload proof images</p>
+                                <small class="text-muted">
+                                    You may upload multiple screenshots (Maps, server time, etc.)
+                                </small>
+                            </div>
+
+                            <div id="upload" style="display: none;">
+                                <p class="mb-1 fw-semibold mt-2">
+                                    Upload proof images
+                                </p>
+                            </div>
+
+
+                        </div>
+
+                        <!-- PREVIEW GRID -->
+                        <div id="proofPreviewGrid" class="proof-grid mt-3"></div>
+
+                        <small class="text-muted d-block mt-2">
+                            Tap the box to add more images
+                        </small>
+                    </div>
+                </div>
+
+                <div class="modal-footer border-0">
+                    <button class="btn btn-light px-4" data-bs-dismiss="modal">
+                        Cancel
+                    </button>
+                    <button class="btn btn-success px-4" id="submitReportBtn" onclick="submitReport()">
+                        <span id="reportBtnText">Submit Report</span>
+
+                        <span id="reportBtnLoader" class="spinner-border spinner-border-sm ms-2" style="display:none;"
+                            role="status">
+                        </span>
+                    </button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container position-fixed top-0 end-0 p-4" style="z-index: 9999">
+        <div id="liveToast" class="toast align-items-center border-0 shadow-lg rounded-4" role="alert">
+
+            <div class="toast-header bg-white text-dark">
+                <strong class="me-auto">CHI</strong>
+                <small id="toastTimer">Closing in 3s</small>
+                <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+            </div>
+
+            <div class="toast-body bg-white text-dark fw-semibold" id="toastMessage">
+            </div>
+
+        </div>
+    </div>
+
+
+    <div class="modal fade" id="rejectedModal">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content p-4 rounded-4 shadow-lg">
+
+                <div class="modal-header border-0">
+                    <h5 class="modal-title text-danger fw-bold">
+                        <i class="bi bi-x-circle-fill me-2"></i>
+                        Report Rejected
+                    </h5>
+                    <button class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+
+                <div class="modal-body">
+                    <p class="text-muted mb-2">Admin Reason:</p>
+
+                    <div class="alert alert-danger rounded-3">
+                        <span id="rejectedReasonText"></span>
+                    </div>
+
+                    <div class="mt-3 text-muted small">
+                        You may correct your explanation and submit another report.
+                    </div>
+                </div>
+
+                <div class="modal-footer border-0">
+                    <button class="btn btn-light rounded-pill px-4" data-bs-dismiss="modal">
+                        Close
+                    </button>
+
+                    <button class="btn btn-danger rounded-pill px-4" onclick="submitAnotherReport()">
+                        <i class="bi bi-arrow-repeat me-1"></i>
+                        Submit Another Report
+                    </button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+
+
+
+    <script>
+
+let manualLat = "";
+let manualLng = "";
+
+        let mapPickerModal = new bootstrap.Modal(document.getElementById('mapPickerModal'));
+
+        let pickedLat = null;
+        let pickedLng = null;
+        let pickerMap;
+        let pickerMarker;
+
+        // OPEN MAP
+        function openMapPicker() {
+
+            mapPickerModal.show();
+
+            setTimeout(() => {
+
+                if (!pickerMap) {
+                    pickerMap = L.map('mapPicker').setView([latitude, longitude], 16);
+
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        maxZoom: 19
+                    }).addTo(pickerMap);
+
+                    pickerMarker = L.marker([latitude, longitude], { draggable: true }).addTo(pickerMap);
+
+                    pickedLat = latitude;
+                    pickedLng = longitude;
+
+                    // CLICK TO MOVE PIN
+                    pickerMap.on('click', function (e) {
+                        pickedLat = e.latlng.lat;
+                        pickedLng = e.latlng.lng;
+                        pickerMarker.setLatLng(e.latlng);
+                    });
+
+                    // DRAG PIN
+                    pickerMarker.on('dragend', function (e) {
+                        let pos = e.target.getLatLng();
+                        pickedLat = pos.lat;
+                        pickedLng = pos.lng;
+                    });
+
+                } else {
+                    pickerMap.invalidateSize();
+                }
+
+            }, 300);
+        }
+
+        // CONFIRM LOCATION
+      function confirmPickedLocation() {
+
+    if (!pickedLat || !pickedLng) return;
+
+    manualLat = pickedLat;
+    manualLng = pickedLng;
+
+    const manualText = document.getElementById("manualAddressText");
+    manualText.style.display = "block";
+    manualText.innerText = "📍 Fetching selected location...";
+
+    // 🔥 fetch real address of pinned location
+    fetch(`reverse_geocode.php?lat=${pickedLat}&lon=${pickedLng}`)
+        .then(res => res.json())
+        .then(data => {
+            manualText.innerText = "📍 Selected Location: " + (data.display_name || "Custom location");
+        })
+        .catch(() => {
+            manualText.innerText = "📍 Custom location selected";
+        });
+
+    mapPickerModal.hide();
+}
+    </script>
+
+    <script>
+
+        function breakAction(type) {
+
+            fetch("break_action.php", {
+                method: "POST",
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: "type=" + type
+            })
+                .then(res => res.text())
+                .then(msg => {
+                    showToast(msg, "success");
+                    setTimeout(() => location.reload(), 1200);
+                })
+                .catch(() => {
+                    showToast("Error processing break", "error");
+                });
+
+        }
+
+        // let rejectedModal = new bootstrap.Modal(document.getElementById('rejectedModal'));
+
+        let rejectedAttendanceId = null;
+        let rejectedModal = new bootstrap.Modal(document.getElementById('rejectedModal'));
+
+        function openRejectedModal(reason, attendanceId) {
+            document.getElementById("rejectedReasonText").innerText =
+                reason || "No reason provided by admin.";
+
+            rejectedAttendanceId = attendanceId;
+
+            rejectedModal.show();
+        }
+
+        function submitAnotherReport() {
+
+            // Close rejected modal
+            rejectedModal.hide();
+
+            // Reset previous report form
+            proofFiles = [];
+            document.getElementById('reportReason').value = "";
+            document.getElementById('proofPreviewGrid').innerHTML = "";
+            document.getElementById('proofPlaceholder').style.display = "block";
+
+            // Set attendance ID automatically
+            document.getElementById('reportAttendanceId').value = rejectedAttendanceId;
+
+            // Open report modal
+            reportModal.show();
+        }
+
+        function showToast(message, type = "success") {
+
+            const toastEl = document.getElementById("liveToast");
+            const toastBody = document.getElementById("toastMessage");
+            const toastTimer = document.getElementById("toastTimer");
+
+            toastBody.textContent = message;
+
+            // Remove previous color classes
+            toastEl.classList.remove("bg-success", "bg-danger", "text-white");
+
+            if (type === "success") {
+                toastEl.classList.add("bg-success", "text-white");
+            } else if (type === "error") {
+                toastEl.classList.add("bg-danger", "text-white");
+            }
+
+            const toast = new bootstrap.Toast(toastEl, {
+                autohide: true,
+                delay: 3000
+            });
+
+            toast.show();
+
+            // 🔥 Countdown logic
+            let timeLeft = 3;
+            toastTimer.textContent = `Closing in ${timeLeft}s`;
+
+            const countdown = setInterval(() => {
+                timeLeft--;
+                if (timeLeft > 0) {
+                    toastTimer.textContent = `Closing in ${timeLeft}s`;
+                } else {
+                    clearInterval(countdown);
+                }
+            }, 1000);
+
+            // Clear interval if manually closed
+            toastEl.addEventListener('hidden.bs.toast', () => {
+                clearInterval(countdown);
+            });
+        }
+    </script>
+
+    <script>
+        
+        let type = "";
+        let latitude = "";
+        let longitude = "";
+        let modal = new bootstrap.Modal(document.getElementById('attendanceModal'));
+
+        async function requestAccess(action) {
+
+            const allowed = await checkPermissions();
+
+            if (!allowed) return;
+
+            openModal(action);
+        }
+        async function checkPermissions() {
+
+            try {
+
+                await navigator.mediaDevices.getUserMedia({ video: true });
+
+                navigator.geolocation.getCurrentPosition(
+                    () => { },
+                    () => alert("Please allow location access.")
+                );
+
+                return true;
+
+            } catch (err) {
+
+                alert("Camera permission denied. Please allow camera access.");
+                return false;
+
+            }
+        }
+
+
+        function openModal(action) {
+            type = action;
+            document.getElementById("modalTitle").innerText =
+                action === "in" ? "Time In" : "Time Out";
+
+            modal.show();
+            startCamera();
+            startClock();
+            getLocation();
+            document.getElementById("confirmBtn").disabled = true;
+        }
+
+
+        function startCamera() {
+            const video = document.getElementById("video");
+
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(stream => {
+                    video.srcObject = stream;
+                })
+                .catch(() => {
+                    alert("Camera access denied or not available.");
+                });
+        }
+
+        document.getElementById('attendanceModal')
+            .addEventListener('hidden.bs.modal', function () {
+                const video = document.getElementById("video");
+                const stream = video.srcObject;
+
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                    video.srcObject = null;
+                }
+            });
+
+        function startClock() {
+            setInterval(() => {
+                document.getElementById("liveTime").innerText =
+                    new Date().toLocaleString();
+            }, 1000);
+        }
+
+        function getLocation() {
+            const loader = document.getElementById("addressLoader");
+            const addressText = document.getElementById("addressText");
+            const mapContainer = document.getElementById("mapContainer");
+            const mapFrame = document.getElementById("mapFrame");
+
+                const manualBtn = document.getElementById("manualLocationBtn");
+
+            if (!navigator.geolocation) {
+                alert("GPS not supported");
+                return;
+            }
+
+            loader.style.display = "block";
+            addressText.innerText = "Detecting location...";
+            mapContainer.style.display = "none";
+                // 🔥 HIDE BUTTON WHILE LOADING
+    manualBtn.style.display = "none";
+
+            navigator.geolocation.getCurrentPosition(function (pos) {
+
+                latitude = pos.coords.latitude;
+                longitude = pos.coords.longitude;
+
+                mapFrame.src = `https://www.openstreetmap.org/export/embed.html?bbox=${longitude - 0.005}%2C${latitude - 0.005}%2C${longitude + 0.005}%2C${latitude + 0.005}&layer=mapnik&marker=${latitude}%2C${longitude}`;
+
+                mapContainer.style.display = "block";
+
+                fetch(`reverse_geocode.php?lat=${latitude}&lon=${longitude}`)
+                    .then(res => res.json())
+                    .then(data => {
+                        addressText.innerText = data.display_name || "Address not found";
+                        loader.style.display = "none";
+                        document.getElementById("confirmBtn").disabled = false;
+
+    // ✅ SHOW BUTTON AFTER SUCCESS
+    manualBtn.style.display = "inline-block";
+                    })
+                    .catch(() => {
+                        addressText.innerText = "Unable to fetch address.";
+                        loader.style.display = "none";
+    // ✅ STILL SHOW BUTTON (user might need manual fix)
+    manualBtn.style.display = "inline-block";
+                    });
+
+            }, function () {
+                loader.style.display = "none";
+                alert("Location permission denied.");
+            });
+        }
+
+function submitAttendance() {
+
+    const btn = document.getElementById("confirmBtn");
+    const btnText = document.getElementById("btnText");
+    const btnLoader = document.getElementById("btnLoader");
+
+    btn.disabled = true;
+    btnText.innerText = "Processing...";
+    btnLoader.style.display = "inline-block";
+
+    const canvas = document.getElementById("canvas");
+    const video = document.getElementById("video");
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+
+    const image = canvas.toDataURL("image/png");
+
+    fetch("attendance_action.php", {
+        method: "POST",
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body:
+            "image=" + encodeURIComponent(image)
+            + "&type=" + type
+            + "&latitude=" + latitude
+            + "&longitude=" + longitude
+            + "&manual_latitude=" + (manualLat || "")
+            + "&manual_longitude=" + (manualLng || "")
+    })
+        .then(res => res.text())
+        .then(data => {
+            showToast(data, "success");
+            setTimeout(() => location.reload(), 1500);
+        })
+        .catch(() => {
+            showToast("Something went wrong!", "error");
+
+            btn.disabled = false;
+            btnText.innerText = "Confirm";
+            btnLoader.style.display = "none";
+        });
+}
+    </script>
+
+
+    <script>
+        const proofInput = document.getElementById('reportProof');
+        const previewGrid = document.getElementById('proofPreviewGrid');
+        const placeholder = document.getElementById('proofPlaceholder');
+
+        const uploadButton = document.getElementById('upload');
+
+        let proofFiles = [];
+
+        proofInput.addEventListener('change', function () {
+            const files = Array.from(this.files);
+
+            files.forEach(file => {
+                if (!file.type.startsWith('image/')) return;
+
+                proofFiles.push(file);
+
+                const reader = new FileReader();
+                reader.onload = function (e) {
+                    const div = document.createElement('div');
+                    div.className = 'proof-item';
+
+                    div.innerHTML = `
+                    <img src="${e.target.result}">
+                    <button class="remove-proof">&times;</button>
+                `;
+
+                    div.querySelector('.remove-proof').onclick = () => {
+                        proofFiles = proofFiles.filter(f => f !== file);
+                        div.remove();
+
+                        if (proofFiles.length === 0) {
+                            placeholder.style.display = 'block';
+                            uploadButton.style.display = 'none';
+                        }
+                    };
+
+                    previewGrid.appendChild(div);
+                    placeholder.style.display = 'none';
+                    uploadButton.style.display = 'block';
+                };
+
+                reader.readAsDataURL(file);
+            });
+
+            // reset input so user can reselect same file if needed
+            this.value = "";
+        });
+    </script>
+
+
+    <script>
+        let reportModal = new bootstrap.Modal(document.getElementById('reportModal'));
+
+        document.getElementById('reportProof').addEventListener('change', () => {
+            document.querySelector('#reportModal .btn-success').disabled = false;
+        });
+
+        function openReportModal(attendanceId) {
+            document.getElementById('reportAttendanceId').value = attendanceId;
+            reportModal.show();
+        }
+        function submitReport() {
+
+            const btn = document.getElementById("submitReportBtn");
+            const btnText = document.getElementById("reportBtnText");
+            const btnLoader = document.getElementById("reportBtnLoader");
+
+            if (proofFiles.length === 0) {
+                showToast("Please upload at least one proof image.", "error");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('attendance_id', document.getElementById('reportAttendanceId').value);
+            formData.append('type', document.getElementById('reportType').value);
+            formData.append('reason', document.getElementById('reportReason').value);
+
+            proofFiles.forEach((file) => {
+                formData.append('proofs[]', file);
+            });
+
+            /* 🔥 SHOW LOADER */
+            btn.disabled = true;
+            btnText.innerText = "Submitting...";
+            btnLoader.style.display = "inline-block";
+
+            fetch('submit_report.php', {
+                method: 'POST',
+                body: formData
+            })
+                .then(res => res.text())
+                .then(msg => {
+
+                    reportModal.hide();
+
+                    // reset UI
+                    proofFiles = [];
+                    previewGrid.innerHTML = "";
+                    placeholder.style.display = 'block';
+                    document.getElementById('reportReason').value = "";
+
+                    showToast("Report submitted. Admin will review it.", "success");
+
+                    setTimeout(() => location.reload(), 1500);
+                })
+                .catch(() => {
+
+                    showToast("Failed to submit report.", "error");
+
+                    /* RESTORE BUTTON */
+                    btn.disabled = false;
+                    btnText.innerText = "Submit Report";
+                    btnLoader.style.display = "none";
+
+                });
+        }
+    </script>
+
+
+</body>
+
+</html>
